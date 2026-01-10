@@ -159,8 +159,7 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
     if endpoint.request_body:
         headers.append(f"# request_schema_hash: {endpoint.request_body.hash}")
     for code, schema in endpoint.responses.items():
-        if code.startswith('2'):
-            headers.append(f"# response_schema_hash_{code}: {schema.hash}")
+        headers.append(f"# response_schema_hash_{code}: {schema.hash}")
     
     # Block Content
     block_lines = []
