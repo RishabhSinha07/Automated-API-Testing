@@ -3,19 +3,65 @@
 A service that generates and updates API tests from API documentation.
 
 ## Requirements
-- Python 3.11
+- Python 3.11+
 
 ## Project Structure
 - `src/api_test_gen/`: Main package
-  - `parser/`: Parses API documentation (e.g., OpenAPI, GraphQL).
-  - `ir/`: Intermediate Representation of the API.
-  - `diff/`: Identifies changes between different versions of API documentation.
-  - `generator/`: Generates test cases from the IR.
-  - `updater/`: Updates existing tests based on diffs.
-  - `state/`: Manages the state of generated tests and documentation versions.
-  - `api/`: Public API/CLI for the service.
+  - `parser/`: Parses OpenAPI specifications into IR.
+  - `ir/`: Intermediate Representation (APISpec, Endpoint models).
+  - `diff/`: Identifies changes between spec and local repo.
+  - `generator/`: Generates test code and assertions.
+  - `state/`: Scans and manages repo state (metadata).
+  - `cli.py`: Command-line interface entry point.
 
 ## Installation
 ```bash
+# Clone the repository
+git clone <repo-url>
+cd Automated-API-Testing
+
+# Install in editable mode
 pip install -e .
 ```
+
+## CLI Usage
+
+The project provides a CLI tool named `apitestgen`.
+
+### Generate Tests
+Generate or update test files from an OpenAPI spec into a local repository.
+
+```bash
+apitestgen generate --spec <path_to_spec> --repo <path_to_repo>
+```
+
+**Options:**
+- `--spec`: Path to OpenAPI JSON/YAML file (Required).
+- `--repo`: Path to local repository where test files are stored (Required).
+- `--verbose`: Enable detailed logging of the generation process.
+
+**Example:**
+```bash
+apitestgen generate --spec spec.json --repo ./my-tests --verbose
+```
+
+### Inspect Diffs
+Show endpoint changes that would be applied without modifying any files.
+
+```bash
+apitestgen diff --spec <path_to_spec> --repo <path_to_repo>
+```
+
+### Clean Obsolete Tests (Experimental)
+Identify and remove test files that no longer correspond to endpoints in the spec.
+
+```bash
+apitestgen clean --repo <path_to_repo>
+```
+
+## Development
+To run tests:
+```bash
+pytest
+```
+

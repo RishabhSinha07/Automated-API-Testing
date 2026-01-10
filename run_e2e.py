@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     repo_path = os.path.abspath("dummyGitRepo")
-    spec_path = "dummy_api.json"
+    spec_path = "swaggerDocForTesting/petStore.json"
 
     logger.info("=== Starting E2E Test Run ===")
 
@@ -46,7 +46,7 @@ def main():
         # But to be robust for future runs, let's pass the endpoint map.
         
         endpoint_map = spec.endpoint_map
-        generator.apply_diff_with_spec(diff, endpoint_map)
+        generator.apply_diff_with_spec(diff, endpoint_map, spec.components)
         logger.info("Changes applied successfully.")
     else:
         logger.info("No changes needed.")

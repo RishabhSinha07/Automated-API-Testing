@@ -9,7 +9,15 @@ description = "A service that generates and updates API tests from API documenta
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-dependencies = []
+dependencies = [
+    "PyYAML>=6.0",
+    "requests>=2.31.0",
+    "jsonschema>=4.19.0",
+    "click>=8.1.0",
+]
+
+[project.scripts]
+apitestgen = "api_test_gen.cli:main"
 
 [project.optional-dependencies]
 dev = [
