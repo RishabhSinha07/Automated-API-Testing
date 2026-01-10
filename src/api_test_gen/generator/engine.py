@@ -145,6 +145,9 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
     if not os.path.exists(test_dir):
         os.makedirs(test_dir, exist_ok=True)
     
+    # Ensure client.py exists in tests root
+    _ensure_client_exists(repo_path)
+    
     safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
     filename = f"{endpoint.method.lower()}_{safe_path}.py"
     file_path = os.path.join(test_dir, filename)
@@ -332,3 +335,43 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
             return header + [content]
 
         return header + filtered_lines
+
+def _ensure_client_exists(repo_path: str) -> None:
+    """Creates a default client.py in the tests/ directory if it doesn't exist."""
+    client_path = os.path.join(repo_path, "tests/client.py")
+    if os.path.exists(client_path):
+        return
+
+    content = """import requests
+import os
+
+class APIClient:
+    \"\"\"
+    A simple wrapper around requests.Session to provide a base URL 
+    and common configuration for generated tests.
+    \"\"\"
+    def __init__(self, base_url=None):
+        self.session = requests.Session()
+        self.base_url = base_url or os.getenv("API_BASE_URL", "https://api.example.com")
+        
+    def request(self, method, path, **kwargs):
+        if not path.startswith("/"):
+            path = "/" + path
+        url = self.base_url + path
+        return self.session.request(method, url, **kwargs)
+
+    def get(self, path, **kwargs): return self.request("GET", path, **kwargs)
+    def post(self, path, **kwargs): return self.request("POST", path, **kwargs)
+    def put(self, path, **kwargs): return self.request("PUT", path, **kwargs)
+    def delete(self, path, **kwargs): return self.request("DELETE", path, **kwargs)
+    def patch(self, path, **kwargs): return self.request("PATCH", path, **kwargs)
+
+client = APIClient()
+"""
+    try:
+        # Ensure tests dir exists
+        os.makedirs(os.path.dirname(client_path), exist_ok=True)
+        with open(client_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        logger.error(f"Failed to bootstrap client.py: {e}")

@@ -59,6 +59,30 @@ Identify and remove test files that no longer correspond to endpoints in the spe
 apitestgen clean --repo <path_to_repo>
 ```
 
+## Web UI
+
+The UI for this project has been moved to its own repository: **Automated-API-Testing-UI**.
+
+### 1. Start the Backend Server (In this repo)
+The UI communicates with a FastAPI backend. Run it using:
+
+```bash
+# From the project root
+export PYTHONPATH=$PYTHONPATH:$(pwd)/src
+python3 -m api_test_gen.server
+```
+*Port: 8000*
+
+### 2. Start the Frontend (In the UI repo)
+In the **Automated-API-Testing-UI** repository, start the dev server:
+
+```bash
+cd /Users/rishabhsinha/Documents/Projects/Automated-API-Testing-UI
+npm install
+npm run dev
+```
+*Port: 5173 (default)*
+
 ## Development
 To run tests:
 ```bash

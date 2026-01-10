@@ -26,6 +26,10 @@ dev = [
     "isort",
     "mypy",
 ]
+web = [
+    "fastapi",
+    "uvicorn",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
