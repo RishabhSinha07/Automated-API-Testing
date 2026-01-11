@@ -29,7 +29,7 @@ class MutationEngine:
         # Resolve top-level ref
         resolved_schema = self._resolve_schema(schema)
 
-        if resolved_schema.type == "object" and isinstance(base_payload, dict):
+        if (resolved_schema.type == "object" or (resolved_schema.type is None and resolved_schema.properties)) and isinstance(base_payload, dict):
             # 1. Required fields removal
             if resolved_schema.required:
                 for field in resolved_schema.required:

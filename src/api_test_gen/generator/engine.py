@@ -69,7 +69,7 @@ class GenerationEngine:
             neg_count = 0
             sec_count = 0
 
-            if is_new or is_updated:
+            if is_new or is_updated or generate_negative:
                 pos_count, neg_count, sec_count = self._process_endpoint(
                     endpoint, spec.components, base_url, security_tokens, generate_negative
                 )
