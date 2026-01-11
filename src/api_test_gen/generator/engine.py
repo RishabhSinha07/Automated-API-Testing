@@ -10,6 +10,7 @@ from ..diff.engine import DiffResult
 from ..state.repo_manager import TestFileMetadata
 from .payloads import generate_payload
 from .assertions import generate_response_assertions
+from ..negative.engine import generate_negative_tests
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,8 @@ def update_or_create_test_file(
     components: Dict[str, Any], 
     repo_path: str,
     base_url: Optional[str] = None,
-    security_tokens: Optional[Dict[str, str]] = None
+    security_tokens: Optional[Dict[str, str]] = None,
+    generate_negative: bool = True
 ) -> None:
     """
     Updates or creates an API test file with payloads and schema assertions.
@@ -232,7 +234,38 @@ def update_or_create_test_file(
     ]
 
     func_name = f"test_{endpoint.method.lower()}_{safe_path}"
-    
+
+    # Negative Tests
+    negative_blocks = []
+    if generate_negative and endpoint.method.upper() in ["POST", "PUT", "PATCH"] and endpoint.request_body:
+        neg_tests = generate_negative_tests(endpoint.request_body, components)
+        
+        # Try to find an error schema for assertions
+        error_schema = endpoint.responses.get("400") or endpoint.responses.get("422") or endpoint.responses.get("default")
+
+        for desc, neg_payload in neg_tests:
+            neg_func_name = f"{func_name}_negative_{desc}"
+            neg_lines = [
+                f"@pytest.mark.negative",
+                f"def {neg_func_name}():",
+                f"    # --- AUTO-GENERATED START ---",
+                f"    response = client.{endpoint.method.lower()}(f\"{formatted_path}\", json={json.dumps(neg_payload)})",
+                f"    assert response.status_code in [400, 422]"
+            ]
+            
+            if error_schema:
+                try:
+                    neg_lines.append("    data = response.json()")
+                    neg_assertions = generate_response_assertions(error_schema, components, "data")
+                    for a in neg_assertions:
+                        neg_lines.append(f"    {a}")
+                except:
+                    pass
+            
+            neg_lines.append(f"    # --- AUTO-GENERATED END ---")
+            neg_lines.append("")
+            negative_blocks.append("\n".join(neg_lines))
+
     if not os.path.exists(file_path):
         # Create new file
         content = [
@@ -243,7 +276,8 @@ def update_or_create_test_file(
             "",
             f"def {func_name}():",
             *auto_block,
-            ""
+            "",
+            *negative_blocks
         ]
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(content))
@@ -274,43 +308,53 @@ def update_or_create_test_file(
         if "from ..client import client" not in content_str:
             new_lines.append("from ..client import client\n")
         
-        # Handle the function and its block
+        # Handle the main function and its block
         start_marker = "# --- AUTO-GENERATED START ---"
         end_marker = "# --- AUTO-GENERATED END ---"
         
-        if start_marker in content_str and end_marker in content_str:
-            final_lines = []
-            final_lines.extend(new_lines)
-            
-            in_block = False
-            for line in existing_content:
-                if start_marker in line:
-                    final_lines.append(line) # keep the marker line
-                    for bl in block_lines:
-                        final_lines.append(f"    {bl}\n")
-                    in_block = True
-                elif end_marker in line:
-                    final_lines.append(line) # keep the marker line
-                    in_block = False
-                elif not in_block:
-                    final_lines.append(line)
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(final_lines)
-        else:
-            # No block found, maybe it's the old 'pass' style or user deleted markers
-            # For robustness, if 'def func_name' exists, we could append it or just write headers.
-            # Given the prompt, we should probably add the markers if missing for future updates.
-            # Let's try to find the function and replace its body if it's 'pass'
-            if f"def {func_name}" in content_str:
-                # Add block into the function if possible (very basic approach)
-                # Or just write headers and let the user add markers.
-                # Given the prompt, we should probably add the markers if missing for future updates.
-                pass 
-            
-            # For now, we'll just rewrite with headers and preserved content
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(new_lines + existing_content)
+        final_lines = []
+        final_lines.extend(new_lines)
+        
+        # Split existing content into functions or sections to preserve user code
+        # This is tricky. For now, we update the main function's auto-block.
+        # AND we manage the negative functions.
+        
+        in_main_block = False
+        main_block_updated = False
+        
+        for line in existing_content:
+            if f"def {func_name}():" in line:
+                # We'll catch the block inside this function later
+                final_lines.append(line)
+            elif start_marker in line and not main_block_updated:
+                # Assuming the first auto-block belongs to the main function
+                final_lines.append(line)
+                for bl in block_lines:
+                    final_lines.append(f"    {bl}\n")
+                in_main_block = True
+            elif end_marker in line and in_main_block:
+                final_lines.append(line)
+                in_main_block = False
+                main_block_updated = True
+            elif not in_main_block:
+                # Check if this line is part of a negative function we already have
+                # If so, we'll replace its block or skip it to be recreated
+                # Actually, simpler: search and replace all negative test blocks
+                final_lines.append(line)
+
+        # Append new negative tests if they don't exist
+        # For simplicity in this iteration, we just append them if not present by name
+        for neg_block in negative_blocks:
+            neg_func_name_match = re.search(r"def (test_[^_]+_[^_]+_negative_[^\(]+)\(\):", neg_block)
+            if neg_func_name_match:
+                neg_func_name = neg_func_name_match.group(1)
+                if neg_func_name not in "".join(final_lines):
+                    final_lines.append("\n" + neg_block)
+            else:
+                final_lines.append("\n" + neg_block)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.writelines(final_lines)
 
     def _patch_metadata(self, lines: List[str], endpoint: Endpoint) -> List[str]:
         """

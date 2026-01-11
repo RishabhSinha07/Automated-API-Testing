@@ -46,6 +46,7 @@ class GenerateRequest(BaseModel):
     repo_path: str
     tokens: Optional[Dict[str, str]] = None # { "scheme": "token" }
     server_url: Optional[str] = None
+    generate_negative_tests: bool = True
 
 class TestFileResponse(BaseModel):
     fileName: str
@@ -107,7 +108,8 @@ async def generate_tests(request: GenerateRequest):
                 api_spec.components, 
                 request.repo_path,
                 base_url=request.server_url,
-                security_tokens=request.tokens
+                security_tokens=request.tokens,
+                generate_negative=request.generate_negative_tests
             )
             results.append(get_file_info(endpoint, "Created"))
             
@@ -120,7 +122,8 @@ async def generate_tests(request: GenerateRequest):
                     api_spec.components, 
                     request.repo_path,
                     base_url=request.server_url,
-                    security_tokens=request.tokens
+                    security_tokens=request.tokens,
+                    generate_negative=request.generate_negative_tests
                 )
                 results.append(get_file_info(endpoint, "Updated"))
                 
