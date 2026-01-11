@@ -2,12 +2,14 @@ import os
 import sys
 import click
 import logging
+import json
 from typing import Optional
 
 from .parser.openapi import load_from_file
 from .state.repo_manager import read_existing_tests
 from .diff.engine import DiffEngine
-from .generator.engine import GenerationEngine, update_or_create_test_file
+from .generator.engine import GenerationEngine
+from .generator.report_generator import ReportGenerator
 
 # Setup simplified logging for CLI
 def setup_logging(verbose: bool):
@@ -26,8 +28,9 @@ def cli():
 @click.option('--token', multiple=True, help='Security tokens in SCHEME:TOKEN format (e.g. Bearer:my_token)')
 @click.option('--server-url', help='Override the base URL for the API')
 @click.option('--negative/--no-negative', default=True, help='Automatically generate negative test cases')
+@click.option('--dry-run', is_flag=True, help='Simulate actions without writing files')
 @click.option('--verbose', is_flag=True, help='Print detailed logs')
-def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], negative: bool, verbose: bool):
+def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], negative: bool, dry_run: bool, verbose: bool):
     """Generate or update test files from an OpenAPI spec."""
     setup_logging(verbose)
     logger = logging.getLogger("apitestgen")
@@ -36,20 +39,13 @@ def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], nega
     spec_path = os.path.abspath(spec)
 
     # 1. Parse OpenAPI Spec
-    if verbose:
-        logger.info(f"Loading API Spec from {spec_path}...")
     try:
         api_spec = load_from_file(spec_path)
     except Exception as e:
         click.echo(f"Error parsing spec: {e}", err=True)
         sys.exit(1)
 
-    if verbose:
-        logger.info(f"Parsed Spec: {api_spec.title} v{api_spec.version} with {len(api_spec.endpoints)} endpoints.")
-
     # 2. Scan Existing Repo
-    if verbose:
-        logger.info(f"Scanning repository at {repo_path}...")
     try:
         existing_tests = read_existing_tests(repo_path)
     except Exception as e:
@@ -71,66 +67,59 @@ def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], nega
         base_url = api_spec.servers[0].get('url')
 
     # 3. Compute Diff
-    if verbose:
-        logger.info("Computing diff...")
     diff_engine = DiffEngine(api_spec, existing_tests)
     diff = diff_engine.compute_diff()
 
     # 4. Generate/Update files
-    generator = GenerationEngine(repo_path)
+    engine = GenerationEngine(repo_path, dry_run=dry_run)
     
     try:
-        # Create
-        for endpoint in diff.create:
-            if verbose:
-                logger.info(f"Creating: {endpoint.method} {endpoint.path} ({endpoint.id})")
-            update_or_create_test_file(
-                endpoint, 
-                api_spec.components, 
-                repo_path, 
-                base_url=base_url, 
-                security_tokens=tokens_dict,
-                generate_negative=negative
-            )
-            
-        # Update
-        for endpoint_id in diff.update:
-            endpoint = api_spec.endpoint_map.get(endpoint_id)
-            if endpoint:
-                if verbose:
-                    logger.info(f"Updating: {endpoint.method} {endpoint.path} ({endpoint.id})")
-                update_or_create_test_file(
-                    endpoint, 
-                    api_spec.components, 
-                    repo_path, 
-                    base_url=base_url, 
-                    security_tokens=tokens_dict,
-                    generate_negative=negative
-                )
-            elif verbose:
-                logger.warning(f"Endpoint {endpoint_id} marked for update but not found in spec.")
-
-        # Skip
-        if verbose:
-            logger.info(f"Skipping {len(diff.skip)} endpoints.")
-
-        # Delete
-        for metadata in diff.delete:
-            if verbose:
-                logger.info(f"Deleting obsolete: {metadata.relative_path}")
-            generator._delete_test_file(metadata)
+        report = engine.run(
+            api_spec, 
+            diff, 
+            base_url=base_url, 
+            security_tokens=tokens_dict, 
+            generate_negative=negative
+        )
+        
+        # 5. Output summary
+        click.echo("\nGeneration Summary:")
+        if dry_run:
+            click.echo("  [DRY RUN] No files were actually written.")
+        click.echo(f"  Total Endpoints: {report.get('total_endpoints', 0)}")
+        click.echo(f"  Positive Tests: {report.get('positive_tests_count', 0)}")
+        click.echo(f"  Negative Tests: {report.get('negative_tests_count', 0)}")
+        click.echo(f"  Security Tests: {report.get('security_tests_count', 0)}")
+        click.echo(f"  Coverage: {report.get('coverage_percentage', 0.0):.2f}%")
+        
+        if not dry_run:
+            click.echo(f"\nReport saved to {os.path.join(repo_path, 'tests/report.json')}")
 
     except Exception as e:
-        click.echo(f"Error writing files: {e}", err=True)
+        logger.exception("Generation failed")
+        click.echo(f"Error during generation: {e}", err=True)
         sys.exit(2)
 
-    # 5. Output summary
-    click.echo("\nGeneration Summary:")
-    click.echo(f"  Created: {len(diff.create)} files")
-    click.echo(f"  Updated: {len(diff.update)} files")
-    click.echo(f"  Skipped: {len(diff.skip)} files")
-    if diff.delete:
-        click.echo(f"  Deleted: {len(diff.delete)} files")
+@cli.command()
+@click.option('--repo', required=True, type=click.Path(exists=True), help='Path to local repository')
+def report(repo: str):
+    """Display the latest generation report."""
+    repo_path = os.path.abspath(repo)
+    report_data = ReportGenerator.get_report(repo_path)
+    if not report_data:
+        click.echo("No report found. Run 'generate' first.")
+        return
+
+    click.echo(f"API Test Generation Report")
+    click.echo(f"==========================")
+    click.echo(f"Total Endpoints: {report_data['total_endpoints']}")
+    click.echo(f"Positive Tests:  {report_data['positive_tests_count']}")
+    click.echo(f"Negative Tests:  {report_data['negative_tests_count']}")
+    click.echo(f"Security Tests:  {report_data['security_tests_count']}")
+    click.echo(f"Overall Coverage: {report_data['coverage_percentage']:.2f}%")
+    click.echo(f"\nEndpoint Details:")
+    for ep in report_data['endpoints']:
+        click.echo(f"  {ep['id']}: Pos={ep['positive']}, Neg={ep['negative']}, Sec={ep['security']}")
 
 @cli.command()
 @click.option('--spec', required=True, type=click.Path(exists=True))
@@ -162,9 +151,6 @@ def diff(spec: str, repo: str):
 @click.option('--dry-run', is_flag=True)
 def clean(repo: str, dry_run: bool):
     """Remove obsolete generated tests."""
-    # Current implementation of clean would need a spec to know what's obsolete,
-    # or it could just clean everything in tests/endpoints that's not in the spec.
-    # For now, this is a placeholder.
     click.echo("Clean command is not fully implemented yet.")
 
 def main():

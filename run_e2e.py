@@ -40,14 +40,8 @@ def main():
     if diff.create or diff.update or diff.delete:
         logger.info("Applying changes...")
         generator = GenerationEngine(repo_path)
-        # We need to map endpoints for updates if any, though initially update list is strings
-        # For 'create', diff.create has objects.
-        # For this E2E, we are mostly testing Create. 
-        # But to be robust for future runs, let's pass the endpoint map.
-        
-        endpoint_map = spec.endpoint_map
-        generator.apply_diff_with_spec(diff, endpoint_map, spec.components)
-        logger.info("Changes applied successfully.")
+        report = generator.run(spec, diff)
+        logger.info(f"Changes applied successfully. Coverage: {report.get('coverage_percentage', 0):.2f}%")
     else:
         logger.info("No changes needed.")
 

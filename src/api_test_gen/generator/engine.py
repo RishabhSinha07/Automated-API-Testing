@@ -2,423 +2,440 @@ import os
 import re
 import logging
 import json
+import shutil
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
-from ..ir.models import Endpoint, APISpec
+from ..ir.models import Endpoint, APISpec, SchemaRef
 from ..diff.engine import DiffResult
 from ..state.repo_manager import TestFileMetadata
 from .payloads import generate_payload
 from .assertions import generate_response_assertions
-from ..negative.engine import generate_negative_tests
+from .payloads import generate_payload
+from .assertions import generate_response_assertions
 
 logger = logging.getLogger(__name__)
 
 class GenerationEngine:
-    def __init__(self, repo_path: str, test_dir_name: str = "tests/endpoints"):
+    def __init__(self, repo_path: str, dry_run: bool = False):
+        from .report_generator import ReportGenerator
+        from ..negative.security_negative_tests import SecurityNegativeTests
         self.repo_path = repo_path
-        self.test_dir = os.path.join(repo_path, test_dir_name)
+        self.dry_run = dry_run
+        self.report_gen = ReportGenerator(repo_path)
+        self.mutation_engine = None
+        self.error_gen = None
+        self.security_gen = SecurityNegativeTests()
+
+    def run(self, spec: APISpec, diff: DiffResult, base_url: str = None, security_tokens: Dict[str, str] = None, generate_negative: bool = True) -> Dict[str, Any]:
+        """
+        Coordinates the entire generation process.
+        """
+        from ..negative.mutation_engine import MutationEngine
+        from ..negative.error_assertion_generator import ErrorAssertionGenerator
         
-    def apply_diff(self, diff: DiffResult) -> None:
-        """
-        Applies changes based on the diff result.
-        """
-        # Ensure target directory exists for creations
-        if diff.create and not os.path.exists(self.test_dir):
-            os.makedirs(self.test_dir, exist_ok=True)
+        self.mutation_engine = MutationEngine(spec.components)
+        self.error_gen = ErrorAssertionGenerator(spec.components)
+        
+        # 0. Migrate legacy tests if any
+        if not self.dry_run:
+            self._migrate_legacy_tests()
 
-        # 1. Handle Creates
-        for endpoint in diff.create:
-            self._create_test_file(endpoint)
+        # Ensure client exists
+        if not self.dry_run:
+            _ensure_client_exists(self.repo_path, base_url, security_tokens)
 
-        # 2. Handle Updates
-        # update list contains string IDs. We likely need the Endpoint object.
-        # But DiffResult only has IDs for update/skip.
-        # Wait, DiffResult definition in previous step: update: List[str]
-        # I need the actual Endpoint object to generate new metadata/code.
-        # The DiffEngine caller usually has existing_tests and new_spec. 
-        # But here I only have DiffResult.
-        # I should assume DiffResult might need to carry the Endpoint object or I need access to the Spec.
-        # The prompt says: "Inputs: diff_map... repo_path".
-        # It doesn't explicitly pass the APISpec.
-        # However, to generate code for "create", I definitely need the Endpoint object which is in diff.create.
-        # For "update", diff.update is List[str]. I can't generate code without the Endpoint object.
-        # I will assume the caller passes the APISpec or a map of ID->Endpoint, 
-        # OR I must modify DiffResult in memory? 
-        # Let's assume for this implementation that I have access to the objects or the DiffResult matches my needs.
-        # The previous DiffResult `update` was `List[str]`. 
-        # I will change the signature of `apply_diff` to accept `spec_map` (ID->Endpoint) to simplify looking up the new endpoint data.
-        pass
-
-    def apply_diff_with_spec(self, diff: DiffResult, endpoint_map: Dict[str, Endpoint], components: Dict[str, Any] = None) -> None:
-        """
-        Applies changes based on the diff result, using the endpoint map for details.
-        """
-        self.components = components or {}
-        if diff.create and not os.path.exists(self.test_dir):
-            os.makedirs(self.test_dir, exist_ok=True)
-
-        for endpoint in diff.create:
-            update_or_create_test_file(endpoint, self.components, self.repo_path)
-
-        for endpoint_id in diff.update:
-            if endpoint_id in endpoint_map:
-                update_or_create_test_file(endpoint_map[endpoint_id], self.components, self.repo_path)
-            else:
-                logger.warning(f"Endpoint {endpoint_id} marked for update but not found in spec.")
-
-        for endpoint_id in diff.skip:
-            logger.info(f"Skipping {endpoint_id} (unchanged)")
-
+        # 1. Handle Deletions (and moves)
         for metadata in diff.delete:
             self._delete_test_file(metadata)
 
-    def _get_file_path(self, endpoint: Endpoint) -> str:
-        # Deterministic filename: {method}_{path_slug}.py
-        # Remove parameters {id} -> id
-        safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
-        filename = f"{endpoint.method.lower()}_{safe_path}.py"
-        return os.path.join(self.test_dir, filename)
-
-    def _create_test_file(self, endpoint: Endpoint) -> None:
-        file_path = self._get_file_path(endpoint)
-        logger.info(f"Creating test file for {endpoint.id} at {file_path}")
+        # 2. Handle Creations and Updates
+        all_endpoints = list(spec.endpoints)
         
-        content = self._generate_file_content(endpoint)
+        for endpoint in spec.endpoints:
+            # We process all endpoints to get full report, 
+            # but only write if they are in create or update.
+            # Actually, standard behavior is only touch what changed.
+            # But for the report, we might want to know about skipped ones too.
+            # DiffResult doesn't have the Endpoint objects for updated/skipped, 
+            # so we use the spec.
+            
+            is_new = endpoint in diff.create
+            is_updated = endpoint.id in diff.update
+            is_skipped = endpoint.id in diff.skip
+            
+            # For report generation
+            pos_count = 0
+            neg_count = 0
+            sec_count = 0
+
+            if is_new or is_updated:
+                pos_count, neg_count, sec_count = self._process_endpoint(
+                    endpoint, spec.components, base_url, security_tokens, generate_negative
+                )
+            elif is_skipped:
+                # We should still count them for the report if we can.
+                # Since we don't regenerate, we can't be 100% sure of the count without reading the file,
+                # but for simplicity, let's assume 1 positive and some estimate or just count 1.
+                pos_count = 1 
+                # Ideally we'd scan the existing file to count tests.
+            
+            self.report_gen.add_endpoint_stats(endpoint.id, pos_count, neg_count, sec_count)
+
+        if not self.dry_run:
+            return self.report_gen.generate_report()
+        else:
+            logger.info("Dry run: Skipping report file generation.")
+            return self.report_gen.stats
+
+    def _process_endpoint(
+        self, 
+        endpoint: Endpoint, 
+        components: Dict[str, SchemaRef], 
+        base_url: str, 
+        security_tokens: Dict[str, str],
+        generate_negative: bool
+    ) -> Tuple[int, int, int]:
+        """
+        Generates positive, negative, and security tests for an endpoint.
+        Returns (positive_count, negative_count, security_count)
+        """
+        pos_count = 0
+        neg_count = 0
+        sec_count = 0
+
+        # Positive Test
+        if self._generate_positive_test_file(endpoint, components, base_url, security_tokens):
+            pos_count = 1
+
+        # Negative Tests
+        if generate_negative:
+            neg_count = self._generate_negative_test_file(endpoint, components, base_url, security_tokens)
+            sec_count = self._generate_security_test_file(endpoint, components, base_url, security_tokens)
+
+        return pos_count, neg_count, sec_count
+
+    def _migrate_legacy_tests(self):
+        legacy_dir = os.path.join(self.repo_path, "tests", "endpoints")
+        positive_dir = os.path.join(self.repo_path, "tests", "positive")
+        
+        if os.path.exists(legacy_dir) and os.path.isdir(legacy_dir):
+            logger.info(f"Migrating legacy tests from {legacy_dir} to {positive_dir}")
+            os.makedirs(positive_dir, exist_ok=True)
+            for filename in os.listdir(legacy_dir):
+                old_path = os.path.join(legacy_dir, filename)
+                new_path = os.path.join(positive_dir, filename)
+                if os.path.isfile(old_path) and not os.path.exists(new_path):
+                    shutil.move(old_path, new_path)
+                elif os.path.isfile(old_path):
+                    # Destination exists, just delete old one to be clean
+                    os.remove(old_path)
+            
+            # Clean up empty legacy dir
+            try:
+                if not os.listdir(legacy_dir):
+                    os.rmdir(legacy_dir)
+            except Exception as e:
+                logger.warning(f"Could not remove legacy directory {legacy_dir}: {e}")
+
+    def _get_safe_filename(self, endpoint: Endpoint) -> str:
+        safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
+        return f"{endpoint.method.lower()}_{safe_path}.py"
+
+    def _write_file(self, folder: str, filename: str, content: str):
+        if self.dry_run:
+            logger.info(f"Dry run: Would write to tests/{folder}/{filename}")
+            return True
+        
+        dir_path = os.path.join(self.repo_path, "tests", folder)
+        os.makedirs(dir_path, exist_ok=True)
+        file_path = os.path.join(dir_path, filename)
+        
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
+            return True
         except Exception as e:
             logger.error(f"Failed to write file {file_path}: {e}")
+            return False
 
-    def _update_test_file(self, endpoint: Endpoint) -> None:
-        # We need to find the existing file. 
-        # Ideally we'd use the path from metadata, but here we calculate it deterministically.
-        # If the file was moved, this might fail unless we use the metadata from the diff (Deleted/Existing).
-        # For simplicity, we assume standard paths.
-        file_path = self._get_file_path(endpoint)
+    def _generate_positive_test_file(self, endpoint: Endpoint, components: Dict[str, SchemaRef], base_url: str, security_tokens: Dict[str, str]) -> bool:
+        filename = self._get_safe_filename(endpoint)
         
-        if not os.path.exists(file_path):
-            logger.warning(f"File for update not found at {file_path}. Re-creating.")
-            self._create_test_file(endpoint)
-            return
+        # Check if file exists to preserve user code
+        existing_content = self._read_existing_test("positive", filename)
+        
+        header = self._generate_headers(endpoint)
+        body_lines = self._generate_positive_body(endpoint, components)
+        
+        content = self._assemble_test_file(
+            endpoint, 
+            "positive", 
+            [("test_" + filename.replace(".py", ""), body_lines, [])], 
+            header,
+            existing_content
+        )
+        
+        return self._write_file("positive", filename, content)
 
-        logger.info(f"Updating test file for {endpoint.id} at {file_path}")
+    def _generate_negative_test_file(self, endpoint: Endpoint, components: Dict[str, SchemaRef], base_url: str, security_tokens: Dict[str, str]) -> int:
+        if not endpoint.request_body or endpoint.method.upper() not in ["POST", "PUT", "PATCH"]:
+            return 0
         
-        # Read existing content
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-        except Exception as e:
-            logger.error(f"Failed to read file {file_path}: {e}")
-            return
+        filename = self._get_safe_filename(endpoint)
+        existing_content = self._read_existing_test("negative", filename)
+        
+        # Generate mutations
+        base_payload = generate_payload(endpoint.request_body, components)
+        mutations = self.mutation_engine.generate_mutations(endpoint.request_body, base_payload)
+        
+        if not mutations:
+            return 0
 
-        # Update metadata in-place
-        new_lines = self._patch_metadata(lines, endpoint)
+        # Error schema
+        error_schema = endpoint.responses.get("400") or endpoint.responses.get("422") or endpoint.responses.get("default")
+        error_assertions = self.error_gen.generate_error_assertions(error_schema)
+
+        test_definitions = []
+        for desc, payload in mutations:
+            func_name = f"test_{endpoint.method.lower()}_{self._get_safe_filename(endpoint).replace('.py', '')}_negative_{desc}"
+            
+            formatted_path = self._get_formatted_path(endpoint)
+            
+            body_lines = [
+                f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\", json={payload})",
+                f"assert response.status_code in [400, 422]",
+                "data = response.json()",
+                *[f"{a}" for a in error_assertions]
+            ]
+            test_definitions.append((func_name, body_lines, ["@pytest.mark.negative"]))
+
+        content = self._assemble_test_file(
+            endpoint, 
+            "negative", 
+            test_definitions, 
+            self._generate_headers(endpoint),
+            existing_content
+        )
         
-        # Write back
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(new_lines)
-        except Exception as e:
-            logger.error(f"Failed to write updated file {file_path}: {e}")
+        self._write_file("negative", filename, content)
+        return len(mutations)
+
+    def _generate_security_test_file(self, endpoint: Endpoint, components: Dict[str, SchemaRef], base_url: str, security_tokens: Dict[str, str]) -> int:
+        if not endpoint.security:
+            return 0
+            
+        filename = self._get_safe_filename(endpoint)
+        existing_content = self._read_existing_test("security", filename)
+        
+        scenarios = self.security_gen.generate_security_tests(endpoint)
+        if not scenarios:
+            return 0
+
+        test_definitions = []
+        formatted_path = self._get_formatted_path(endpoint)
+        
+        # We need a basic payload if it's a POST/PUT
+        payload = None
+        if endpoint.request_body:
+            payload = generate_payload(endpoint.request_body, components)
+
+        for scenario in scenarios:
+            func_name = f"test_{endpoint.method.lower()}_{self._get_safe_filename(endpoint).replace('.py', '')}_{scenario['name']}"
+            
+            # Auth override logic
+            # In a real scenario, we might need to modify the client or headers.
+            # Here we assume we can pass headers to the client call.
+            headers_arg = ""
+            if scenario['auth_override'] is None:
+                # Need a way to tell the client to NOT use default auth
+                headers_arg = ", headers={'Authorization': ''}" # Simplistic
+            else:
+                headers_arg = f", headers={{'Authorization': '{scenario['auth_override']}'}}"
+
+            body_lines = []
+            if payload:
+                body_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\", json={payload}{headers_arg})")
+            else:
+                body_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\"{headers_arg})")
+            
+            body_lines.append(f"assert response.status_code in {scenario['expected_status']}")
+            
+            test_definitions.append((func_name, body_lines, ["@pytest.mark.security"]))
+
+        content = self._assemble_test_file(
+            endpoint, 
+            "security", 
+            test_definitions, 
+            self._generate_headers(endpoint),
+            existing_content
+        )
+        
+        self._write_file("security", filename, content)
+        return len(scenarios)
+
+    def _get_formatted_path(self, endpoint: Endpoint) -> str:
+        # Simplistic path parameter replacement for tests
+        path = endpoint.path
+        for p in endpoint.parameters:
+            if p.get('in') == 'path':
+                name = p.get('name')
+                path = path.replace(f"{{{name}}}", "test_id")
+        return path
+
+    def _generate_headers(self, endpoint: Endpoint) -> List[str]:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        headers = [
+            f"# endpoint_id: {endpoint.id}",
+            f"# last_generated: {timestamp}"
+        ]
+        if endpoint.request_body:
+            headers.append(f"# request_schema_hash: {endpoint.request_body.hash}")
+        for code, schema in endpoint.responses.items():
+            headers.append(f"# response_schema_hash_{code}: {schema.hash}")
+        return headers
+
+    def _generate_positive_body(self, endpoint: Endpoint, components: Dict[str, SchemaRef]) -> List[str]:
+        block_lines = []
+        
+        # Handle Parameters
+        query_params = {}
+        for p in endpoint.parameters:
+            if p.get('in') == 'query':
+                query_params[p.get('name')] = 'test_value'
+
+        formatted_path = self._get_formatted_path(endpoint)
+        request_args = []
+        if query_params:
+             request_args.append(f"params={query_params}")
+
+        if endpoint.request_body:
+            payload = generate_payload(endpoint.request_body, components)
+            if endpoint.request_content_type == "application/json":
+                request_args.append(f"json={payload}")
+            else:
+                request_args.append(f"json={payload}")
+
+        args_str = ", ".join(request_args)
+        if args_str:
+            block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\", {args_str})")
+        else:
+            block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\")")
+        
+        success_codes = [c for c in endpoint.responses.keys() if c.startswith('2')]
+        expected_status = success_codes[0] if success_codes else "200"
+        block_lines.append(f"assert response.status_code == {expected_status}")
+
+        if expected_status in endpoint.responses:
+            try:
+                 block_lines.append("data = response.json()")
+                 assertions = generate_response_assertions(endpoint.responses[expected_status], components, "data")
+                 block_lines.extend(assertions)
+            except:
+                 pass
+        return block_lines
+
+    def _read_existing_test(self, folder: str, filename: str) -> Optional[str]:
+        path = os.path.join(self.repo_path, "tests", folder, filename)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return None
+
+    def _assemble_test_file(
+        self, 
+        endpoint: Endpoint, 
+        folder: str, 
+        tests: List[Tuple[str, List[str], List[str]]], 
+        headers: List[str], 
+        existing_content: Optional[str]
+    ) -> str:
+        """
+        Assembles a test file with multiple tests, preserving user code.
+        tests: List of (func_name, body_lines, decorators)
+        """
+        start_marker = "# --- AUTO-GENERATED START ---"
+        end_marker = "# --- AUTO-GENERATED END ---"
+        
+        if not existing_content:
+            # Create new
+            lines = [f"{h}\n" for h in headers]
+            lines.append("\nimport pytest\n")
+            lines.append("from ..client import client\n\n")
+            
+            for func_name, body, decorators in tests:
+                for dec in decorators:
+                    lines.append(f"{dec}\n")
+                lines.append(f"def {func_name}():\n")
+                lines.append(f"    {start_marker}\n")
+                for bl in body:
+                    lines.append(f"    {bl}\n")
+                lines.append(f"    {end_marker}\n\n")
+            return "".join(lines)
+        else:
+            # Update existing
+            # 1. Update headers
+            new_lines = [f"{h}\n" for h in headers]
+            
+            # 2. Keep existing imports and user code
+            existing_lines = existing_content.splitlines(keepends=True)
+            
+            # Filter out old metadata
+            filtered_existing = []
+            for line in existing_lines:
+                if line.startswith("# endpoint_id:") or \
+                   line.startswith("# last_generated:") or \
+                   line.startswith("# request_schema_hash:") or \
+                   re.match(r"# response_schema_hash_\w+:", line):
+                    continue
+                filtered_existing.append(line)
+            
+            new_lines.extend(filtered_existing)
+            content = "".join(new_lines)
+
+            # 3. Update or Add tests
+            for func_name, body, decorators in tests:
+                auto_block = [f"    {start_marker}\n"] + [f"    {bl}\n" for bl in body] + [f"    {end_marker}\n"]
+                
+                # Check if function exists
+                func_pattern = rf"(def {func_name}\(\):.*?\n)"
+                if re.search(func_pattern, content):
+                    # Replace the auto-block inside it
+                    block_pattern = rf"(def {func_name}\(\):.*?\n\s+){re.escape(start_marker)}.*?{re.escape(end_marker)}"
+                    if re.search(block_pattern, content, re.DOTALL):
+                        content = re.sub(block_pattern, rf"\1{''.join(auto_block).strip()}", content, flags=re.DOTALL)
+                    else:
+                        # Function exists but no auto-block? Append it after def.
+                        content = re.sub(func_pattern, rf"\1{''.join(auto_block)}", content)
+                else:
+                    # Append new function
+                    new_func = "\n"
+                    for dec in decorators:
+                        new_func += f"{dec}\n"
+                    new_func += f"def {func_name}():\n"
+                    new_func += "".join(auto_block)
+                    content += new_func
+            
+            return content
 
     def _delete_test_file(self, metadata: TestFileMetadata) -> None:
-        # metadata.relative_path is relative to repo root
         file_path = os.path.join(self.repo_path, metadata.relative_path)
-        
+        if self.dry_run:
+            logger.info(f"Dry run: Would delete {file_path}")
+            return
+
         if os.path.exists(file_path):
             logger.info(f"Deleting test file for {metadata.endpoint_id} at {file_path}")
             try:
                 os.remove(file_path)
             except Exception as e:
                 logger.error(f"Failed to delete file {file_path}: {e}")
-        else:
-            logger.warning(f"File to delete not found: {file_path}")
-
-def update_or_create_test_file(
-    endpoint: Endpoint, 
-    components: Dict[str, Any], 
-    repo_path: str,
-    base_url: Optional[str] = None,
-    security_tokens: Optional[Dict[str, str]] = None,
-    generate_negative: bool = True
-) -> None:
-    """
-    Updates or creates an API test file with payloads and schema assertions.
-    Preserves user code outside AUTO-GENERATED blocks.
-    """
-    # Deterministic Path
-    test_dir = os.path.join(repo_path, "tests/endpoints")
-    if not os.path.exists(test_dir):
-        os.makedirs(test_dir, exist_ok=True)
-    
-    # Ensure client.py exists in tests root
-    _ensure_client_exists(repo_path, base_url, security_tokens)
-    
-    safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
-    filename = f"{endpoint.method.lower()}_{safe_path}.py"
-    file_path = os.path.join(test_dir, filename)
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    
-    # Headers
-    headers = [
-        f"# endpoint_id: {endpoint.id}",
-        f"# last_generated: {timestamp}"
-    ]
-    if endpoint.request_body:
-        headers.append(f"# request_schema_hash: {endpoint.request_body.hash}")
-    for code, schema in endpoint.responses.items():
-        headers.append(f"# response_schema_hash_{code}: {schema.hash}")
-    
-    # Block Content
-    block_lines = []
-    
-    # Handle Parameters (Query/Path)
-    query_params = {}
-    path_replacements = {}
-    for p in endpoint.parameters:
-        p_name = p.get('name')
-        p_in = p.get('in')
-        if p_in == 'query':
-            query_params[p_name] = 'test_value' # Simplistic
-        elif p_in == 'path':
-            path_replacements[p_name] = 'test_id'
-
-    formatted_path = endpoint.path
-    for k, v in path_replacements.items():
-        formatted_path = formatted_path.replace(f"{{{k}}}", v)
-
-    # Request Generation
-    request_args = []
-    if query_params:
-         request_args.append(f"params={json.dumps(query_params)}")
-
-    if endpoint.request_body:
-        payload = generate_payload(endpoint.request_body, components)
-        if endpoint.request_content_type == "application/json":
-            request_args.append(f"json={json.dumps(payload)}")
-        elif endpoint.request_content_type == "application/x-www-form-urlencoded":
-            request_args.append(f"data={json.dumps(payload)}")
-        elif endpoint.request_content_type == "multipart/form-data":
-            request_args.append(f"files={json.dumps(payload)}") # Simplified
-        else:
-            request_args.append(f"json={json.dumps(payload)}")
-
-    args_str = ", ".join(request_args)
-    if args_str:
-        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\", {args_str})")
-    else:
-        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\")")
-    
-    block_lines.append("")
-    # Determine success code
-    success_codes = [c for c in endpoint.responses.keys() if c.startswith('2')]
-    expected_status = success_codes[0] if success_codes else "200"
-    block_lines.append(f"assert response.status_code == {expected_status}")
-
-    if expected_status in endpoint.responses:
-        try:
-             # Basic check if response has content
-             block_lines.append("data = response.json()")
-             assertions = generate_response_assertions(endpoint.responses[expected_status], components, "data")
-             block_lines.extend(assertions)
-        except:
-             pass
-
-    auto_block = [
-        "    # --- AUTO-GENERATED START ---",
-        *[f"    {l}" for l in block_lines],
-        "    # --- AUTO-GENERATED END ---"
-    ]
-
-    func_name = f"test_{endpoint.method.lower()}_{safe_path}"
-
-    # Negative Tests
-    negative_blocks = []
-    if generate_negative and endpoint.method.upper() in ["POST", "PUT", "PATCH"] and endpoint.request_body:
-        neg_tests = generate_negative_tests(endpoint.request_body, components)
-        
-        # Try to find an error schema for assertions
-        error_schema = endpoint.responses.get("400") or endpoint.responses.get("422") or endpoint.responses.get("default")
-
-        for desc, neg_payload in neg_tests:
-            neg_func_name = f"{func_name}_negative_{desc}"
-            neg_lines = [
-                f"@pytest.mark.negative",
-                f"def {neg_func_name}():",
-                f"    # --- AUTO-GENERATED START ---",
-                f"    response = client.{endpoint.method.lower()}(f\"{formatted_path}\", json={json.dumps(neg_payload)})",
-                f"    assert response.status_code in [400, 422]"
-            ]
-            
-            if error_schema:
-                try:
-                    neg_lines.append("    data = response.json()")
-                    neg_assertions = generate_response_assertions(error_schema, components, "data")
-                    for a in neg_assertions:
-                        neg_lines.append(f"    {a}")
-                except:
-                    pass
-            
-            neg_lines.append(f"    # --- AUTO-GENERATED END ---")
-            neg_lines.append("")
-            negative_blocks.append("\n".join(neg_lines))
-
-    if not os.path.exists(file_path):
-        # Create new file
-        content = [
-            *headers,
-            "",
-            "import pytest",
-            "from ..client import client",
-            "",
-            f"def {func_name}():",
-            *auto_block,
-            "",
-            *negative_blocks
-        ]
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(content))
-    else:
-        # Update existing file
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        # Update Headers & ensure imports
-        new_lines = []
-        # Filter existing metadata
-        existing_content = []
-        for line in lines:
-            if line.startswith("# endpoint_id:") or \
-               line.startswith("# last_generated:") or \
-               line.startswith("# request_schema_hash:") or \
-               re.match(r"# response_schema_hash_\w+:", line):
-                continue
-            existing_content.append(line)
-        
-        # Prepend new headers
-        new_lines.extend([f"{h}\n" for h in headers])
-        
-        # Ensure imports
-        content_str = "".join(existing_content)
-        if "import pytest" not in content_str:
-            new_lines.append("import pytest\n")
-        if "from ..client import client" not in content_str:
-            new_lines.append("from ..client import client\n")
-        
-        # Handle the main function and its block
-        start_marker = "# --- AUTO-GENERATED START ---"
-        end_marker = "# --- AUTO-GENERATED END ---"
-        
-        final_lines = []
-        final_lines.extend(new_lines)
-        
-        # Split existing content into functions or sections to preserve user code
-        # This is tricky. For now, we update the main function's auto-block.
-        # AND we manage the negative functions.
-        
-        in_main_block = False
-        main_block_updated = False
-        
-        for line in existing_content:
-            if f"def {func_name}():" in line:
-                # We'll catch the block inside this function later
-                final_lines.append(line)
-            elif start_marker in line and not main_block_updated:
-                # Assuming the first auto-block belongs to the main function
-                final_lines.append(line)
-                for bl in block_lines:
-                    final_lines.append(f"    {bl}\n")
-                in_main_block = True
-            elif end_marker in line and in_main_block:
-                final_lines.append(line)
-                in_main_block = False
-                main_block_updated = True
-            elif not in_main_block:
-                # Check if this line is part of a negative function we already have
-                # If so, we'll replace its block or skip it to be recreated
-                # Actually, simpler: search and replace all negative test blocks
-                final_lines.append(line)
-
-        # Append new negative tests if they don't exist
-        # For simplicity in this iteration, we just append them if not present by name
-        for neg_block in negative_blocks:
-            neg_func_name_match = re.search(r"def (test_[^_]+_[^_]+_negative_[^\(]+)\(\):", neg_block)
-            if neg_func_name_match:
-                neg_func_name = neg_func_name_match.group(1)
-                if neg_func_name not in "".join(final_lines):
-                    final_lines.append("\n" + neg_block)
-            else:
-                final_lines.append("\n" + neg_block)
-        
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.writelines(final_lines)
-
-    def _patch_metadata(self, lines: List[str], endpoint: Endpoint) -> List[str]:
-        """
-        Updates metadata headers in existing file content.
-        Preserves other content.
-        If the function body is just 'pass', it replaces it with real logic.
-        """
-        timestamp = datetime.now(timezone.utc).isoformat()
-        
-        # Pre-process lines to remove existing metadata and capture body
-        filtered_lines = []
-        for line in lines:
-            if line.startswith("# endpoint_id:") or \
-               line.startswith("# last_generated:") or \
-               line.startswith("# request_schema_hash:") or \
-               re.match(r"# response_schema_hash_\w+:", line):
-                continue
-            filtered_lines.append(line)
-            
-        # Ensure client import exists
-        has_client_import = any("from ..client import client" in line for line in filtered_lines)
-        if not has_client_import:
-            # Find a good place for import (after pytest or at top)
-            import_inserted = False
-            for i, line in enumerate(filtered_lines):
-                if line.startswith("import pytest"):
-                    filtered_lines.insert(i + 1, "from ..client import client\n")
-                    import_inserted = True
-                    break
-            if not import_inserted:
-                filtered_lines.insert(0, "from ..client import client\n")
-
-        # Construct new header
-        header = []
-        header.append(f"# endpoint_id: {endpoint.id}\n")
-        header.append(f"# last_generated: {timestamp}\n")
-        
-        if endpoint.request_body:
-            header.append(f"# request_schema_hash: {endpoint.request_body.hash}\n")
-            
-        for code, schema in endpoint.responses.items():
-            header.append(f"# response_schema_hash_{code}: {schema.hash}\n")
-        
-        # Check if function body is just 'pass' and replace if so
-        content = "".join(filtered_lines)
-        func_name = self._get_function_name(endpoint)
-        # Regex to find the function and its body
-        # Matches: def test_foo(): followed by any comments and then 'pass' (with indentation)
-        pass_pattern = rf"(def {func_name}\(\):\s+(?:#[^\n]*\s+)*)pass(\s*)$"
-        
-        if re.search(pass_pattern, content, re.MULTILINE):
-            body_lines = self._generate_test_body(endpoint)
-            replacement_body = "\n".join([f"    {l}" for l in body_lines])
-            content = re.sub(pass_pattern, rf"\1{replacement_body}\2", content, flags=re.MULTILINE)
-            return header + [content]
-
-        return header + filtered_lines
 
 def _ensure_client_exists(
     repo_path: str, 
     base_url: Optional[str] = None, 
     security_tokens: Optional[Dict[str, str]] = None
 ) -> None:
-    """Creates a default client.py in the tests/ directory if it doesn't exist."""
     client_path = os.path.join(repo_path, "tests/client.py")
     if os.path.exists(client_path):
         return
@@ -433,15 +450,10 @@ def _ensure_client_exists(
 import os
 
 class APIClient:
-    \"\"\"
-    A simple wrapper around requests.Session to provide a base URL 
-    and common configuration for generated tests.
-    Supports security schemes and different request formats.
-    \"\"\"
     def __init__(self, base_url=None):
         self.session = requests.Session()
         self.base_url = base_url or os.getenv("API_BASE_URL", "{default_base_url}")
-        self.security_tokens = {{}} # Map scheme name -> token
+        self.security_tokens = {{}}
 
     def set_security_token(self, scheme_name: str, token: str):
         self.security_tokens[scheme_name] = token
@@ -450,19 +462,13 @@ class APIClient:
         if not path.startswith("/"):
             path = "/" + path
         url = self.base_url + path
-        
-        # Auto-inject security if headers aren't already set
         if "headers" not in kwargs:
             kwargs["headers"] = {{}}
-        
-        # Simple injection for Bearer or API Key
         for token in self.security_tokens.values():
             if token.startswith("Bearer "):
                 kwargs["headers"]["Authorization"] = token
             else:
-                # Assuming generic API Key if not Bearer
                 kwargs["headers"]["X-API-Key"] = token
-
         return self.session.request(method, url, **kwargs)
 
     def get(self, path, **kwargs): return self.request("GET", path, **kwargs)
@@ -474,9 +480,15 @@ class APIClient:
 client = APIClient()
 {tokens_code}"""
     try:
-        # Ensure tests dir exists
         os.makedirs(os.path.dirname(client_path), exist_ok=True)
         with open(client_path, 'w', encoding='utf-8') as f:
             f.write(content)
     except Exception as e:
         logger.error(f"Failed to bootstrap client.py: {e}")
+
+# Maintain backward compatibility for the top-level function if needed,
+# but it's better to use the engine class now.
+def update_or_create_test_file(*args, **kwargs):
+    # This is now handled by the engine.run method for better state management.
+    # We could implement a shim if absolutely necessary.
+    pass

@@ -2,15 +2,16 @@ import os
 import tempfile
 import json
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import re
 from .parser.openapi import load_from_file
 from .state.repo_manager import read_existing_tests, TestFileMetadata
 from .diff.engine import DiffEngine
-from .generator.engine import update_or_create_test_file
+from .generator.engine import GenerationEngine
 
 app = FastAPI(title="API TestGen Backend")
 
@@ -47,6 +48,7 @@ class GenerateRequest(BaseModel):
     tokens: Optional[Dict[str, str]] = None # { "scheme": "token" }
     server_url: Optional[str] = None
     generate_negative_tests: bool = True
+    dry_run: bool = False
 
 class TestFileResponse(BaseModel):
     fileName: str
@@ -54,8 +56,9 @@ class TestFileResponse(BaseModel):
     action: str
     timestamp: str
     code: str
+    testType: str # "positive", "negative", "security"
 
-@app.post("/generate", response_model=List[TestFileResponse])
+@app.post("/generate", response_model=Dict[str, Any])
 async def generate_tests(request: GenerateRequest):
     # 1. Save spec content to a temporary file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
@@ -76,76 +79,80 @@ async def generate_tests(request: GenerateRequest):
         diff_engine = DiffEngine(api_spec, existing_tests)
         diff = diff_engine.compute_diff()
         
-        results = []
+        # 5. Initialize Engine
+        engine = GenerationEngine(request.repo_path, dry_run=request.dry_run)
         
         # Helper to get file info after creation/update
-        def get_file_info(endpoint, action):
-            # This logic mimics GenerationEngine._get_file_path
-            import re
+        def get_file_info(endpoint, action, test_type="positive"):
             safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
             filename = f"{endpoint.method.lower()}_{safe_path}.py"
-            file_path = os.path.join(request.repo_path, "tests/endpoints", filename)
+            file_path = os.path.join(request.repo_path, "tests", test_type, filename)
             
             code = ""
             if os.path.exists(file_path):
                 with open(file_path, 'r') as f:
                     code = f.read()
+            elif request.dry_run:
+                code = f"# [Dry Run] This file would be generated in tests/{test_type}/{filename}"
             
-            from datetime import datetime
             return TestFileResponse(
                 fileName=filename,
                 endpointId=endpoint.id,
                 action=action,
                 timestamp="Just now",
-                code=code
+                code=code,
+                testType=test_type
             )
 
-        # 5. Apply changes and collect results
-        # Creates
-        for endpoint in diff.create:
-            update_or_create_test_file(
-                endpoint, 
-                api_spec.components, 
-                request.repo_path,
-                base_url=request.server_url,
-                security_tokens=request.tokens,
-                generate_negative=request.generate_negative_tests
-            )
-            results.append(get_file_info(endpoint, "Created"))
+        # 6. Run Engine
+        report = engine.run(
+            api_spec, 
+            diff, 
+            base_url=request.server_url, 
+            security_tokens=request.tokens, 
+            generate_negative=request.generate_negative_tests
+        )
+
+        results = []
+        for endpoint in api_spec.endpoints:
+            # We want to show results for endpoints that were touched
+            is_new = endpoint in diff.create
+            is_updated = endpoint.id in diff.update
+            is_skipped = endpoint.id in diff.skip
             
-        # Updates
-        for eid in diff.update:
-            endpoint = api_spec.endpoint_map.get(eid)
-            if endpoint:
-                update_or_create_test_file(
-                    endpoint, 
-                    api_spec.components, 
-                    request.repo_path,
-                    base_url=request.server_url,
-                    security_tokens=request.tokens,
-                    generate_negative=request.generate_negative_tests
-                )
-                results.append(get_file_info(endpoint, "Updated"))
+            action = "Skipped"
+            if is_new: action = "Created"
+            if is_updated: action = "Updated"
+            
+            # Add positive
+            results.append(get_file_info(endpoint, action, "positive"))
+            
+            # Add negative if they exist
+            if request.generate_negative_tests:
+                # Check if file exists (or would exist)
+                safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
+                neg_filename = f"{endpoint.method.lower()}_{safe_path}.py"
                 
-        # Skips (optional: show them in results too)
-        for eid in diff.skip:
-            endpoint = api_spec.endpoint_map.get(eid)
-            if endpoint:
-                # We don't update file, but we can read it to show current state
-                results.append(get_file_info(endpoint, "Skipped"))
+                if os.path.exists(os.path.join(request.repo_path, "tests/negative", neg_filename)) or is_new or is_updated or request.dry_run:
+                    results.append(get_file_info(endpoint, action, "negative"))
+                
+                if os.path.exists(os.path.join(request.repo_path, "tests/security", neg_filename)) or is_new or is_updated or request.dry_run:
+                    results.append(get_file_info(endpoint, action, "security"))
 
-        # Deletes
         for meta in diff.delete:
-            # For now just note it was deleted
             results.append(TestFileResponse(
                 fileName=meta.relative_path.split('/')[-1],
                 endpointId=meta.endpoint_id,
                 action="Deleted",
                 timestamp="Just now",
-                code="# This file would be deleted in a real run."
+                code="",
+                testType="positive" # Deletes usually happen for positive files
             ))
 
-        return results
+        return {
+            "files": results,
+            "report": report
+        }
 
     except Exception as e:
         logging.error(f"Generation failed: {e}")
