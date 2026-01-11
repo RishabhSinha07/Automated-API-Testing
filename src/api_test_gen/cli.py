@@ -25,8 +25,9 @@ def cli():
 @click.option('--repo', required=True, type=click.Path(exists=True), help='Path to local repository where test files are stored')
 @click.option('--token', multiple=True, help='Security tokens in SCHEME:TOKEN format (e.g. Bearer:my_token)')
 @click.option('--server-url', help='Override the base URL for the API')
+@click.option('--negative/--no-negative', default=True, help='Automatically generate negative test cases')
 @click.option('--verbose', is_flag=True, help='Print detailed logs')
-def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], verbose: bool):
+def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], negative: bool, verbose: bool):
     """Generate or update test files from an OpenAPI spec."""
     setup_logging(verbose)
     logger = logging.getLogger("apitestgen")
@@ -88,7 +89,8 @@ def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], verb
                 api_spec.components, 
                 repo_path, 
                 base_url=base_url, 
-                security_tokens=tokens_dict
+                security_tokens=tokens_dict,
+                generate_negative=negative
             )
             
         # Update
@@ -102,7 +104,8 @@ def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], verb
                     api_spec.components, 
                     repo_path, 
                     base_url=base_url, 
-                    security_tokens=tokens_dict
+                    security_tokens=tokens_dict,
+                    generate_negative=negative
                 )
             elif verbose:
                 logger.warning(f"Endpoint {endpoint_id} marked for update but not found in spec.")

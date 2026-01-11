@@ -11,8 +11,18 @@ A service that generates and updates API tests from API documentation.
   - `ir/`: Intermediate Representation (APISpec, Endpoint models).
   - `diff/`: Identifies changes between spec and local repo.
   - `generator/`: Generates test code and assertions.
+  - `negative/`: Engine for mutating valid payloads into negative test cases.
   - `state/`: Scans and manages repo state (metadata).
   - `cli.py`: Command-line interface entry point.
+
+## Features
+- **Deterministic IR Parser**: Converts OpenAPI 3.x to a stable internal model.
+- **Smart Diffing**: Detects Added, Updated, and Deleted endpoints with user-code preservation.
+- **Automatic Negative Test Generation**: 
+  - Generates mutations for missing required fields.
+  - Injects wrong-type payloads and invalid enum values.
+  - Tests boundary violations (min-1, max+1) and invalid formats (email, uuid).
+  - Automatically asserts 400/422 status codes and validates error response structures.
 
 ## Installation
 ```bash
@@ -38,6 +48,9 @@ apitestgen generate --spec <path_to_spec> --repo <path_to_repo>
 **Options:**
 - `--spec`: Path to OpenAPI JSON/YAML file (Required).
 - `--repo`: Path to local repository where test files are stored (Required).
+- `--token`: Security tokens in `SCHEME:TOKEN` format (e.g. `Bearer:abc`).
+- `--server-url`: Override the base URL for the API.
+- `--negative / --no-negative`: Toggle automatic negative test generation (Default: enabled).
 - `--verbose`: Enable detailed logging of the generation process.
 
 **Example:**
