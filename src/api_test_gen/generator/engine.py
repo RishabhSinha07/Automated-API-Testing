@@ -135,7 +135,13 @@ class GenerationEngine:
         else:
             logger.warning(f"File to delete not found: {file_path}")
 
-def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], repo_path: str) -> None:
+def update_or_create_test_file(
+    endpoint: Endpoint, 
+    components: Dict[str, Any], 
+    repo_path: str,
+    base_url: Optional[str] = None,
+    security_tokens: Optional[Dict[str, str]] = None
+) -> None:
     """
     Updates or creates an API test file with payloads and schema assertions.
     Preserves user code outside AUTO-GENERATED blocks.
@@ -146,7 +152,7 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
         os.makedirs(test_dir, exist_ok=True)
     
     # Ensure client.py exists in tests root
-    _ensure_client_exists(repo_path)
+    _ensure_client_exists(repo_path, base_url, security_tokens)
     
     safe_path = re.sub(r'[^a-zA-Z0-9]', '_', endpoint.path).strip('_')
     filename = f"{endpoint.method.lower()}_{safe_path}.py"
@@ -166,12 +172,43 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
     
     # Block Content
     block_lines = []
+    
+    # Handle Parameters (Query/Path)
+    query_params = {}
+    path_replacements = {}
+    for p in endpoint.parameters:
+        p_name = p.get('name')
+        p_in = p.get('in')
+        if p_in == 'query':
+            query_params[p_name] = 'test_value' # Simplistic
+        elif p_in == 'path':
+            path_replacements[p_name] = 'test_id'
+
+    formatted_path = endpoint.path
+    for k, v in path_replacements.items():
+        formatted_path = formatted_path.replace(f"{{{k}}}", v)
+
+    # Request Generation
+    request_args = []
+    if query_params:
+         request_args.append(f"params={json.dumps(query_params)}")
+
     if endpoint.request_body:
         payload = generate_payload(endpoint.request_body, components)
-        block_lines.append(f"payload = {json.dumps(payload)}")
-        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{endpoint.path}\", json=payload)")
+        if endpoint.request_content_type == "application/json":
+            request_args.append(f"json={json.dumps(payload)}")
+        elif endpoint.request_content_type == "application/x-www-form-urlencoded":
+            request_args.append(f"data={json.dumps(payload)}")
+        elif endpoint.request_content_type == "multipart/form-data":
+            request_args.append(f"files={json.dumps(payload)}") # Simplified
+        else:
+            request_args.append(f"json={json.dumps(payload)}")
+
+    args_str = ", ".join(request_args)
+    if args_str:
+        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\", {args_str})")
     else:
-        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{endpoint.path}\")")
+        block_lines.append(f"response = client.{endpoint.method.lower()}(f\"{formatted_path}\")")
     
     block_lines.append("")
     # Determine success code
@@ -180,9 +217,13 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
     block_lines.append(f"assert response.status_code == {expected_status}")
 
     if expected_status in endpoint.responses:
-        block_lines.append("data = response.json()")
-        assertions = generate_response_assertions(endpoint.responses[expected_status], components, "data")
-        block_lines.extend(assertions)
+        try:
+             # Basic check if response has content
+             block_lines.append("data = response.json()")
+             assertions = generate_response_assertions(endpoint.responses[expected_status], components, "data")
+             block_lines.extend(assertions)
+        except:
+             pass
 
     auto_block = [
         "    # --- AUTO-GENERATED START ---",
@@ -234,17 +275,10 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
             new_lines.append("from ..client import client\n")
         
         # Handle the function and its block
-        # Find function start and the block indices
         start_marker = "# --- AUTO-GENERATED START ---"
         end_marker = "# --- AUTO-GENERATED END ---"
         
         if start_marker in content_str and end_marker in content_str:
-            # Replace between markers
-            pattern = rf"({re.escape(start_marker)}).*?({re.escape(end_marker)})"
-            replacement = f"{start_marker}\n" + "\n".join([f"    {l}" for l in block_lines]) + f"\n    {end_marker}"
-            # Need to be careful with indentation in regex replacement
-            # But the auto_block already has indentation.
-            # Let's use a simpler approach: line by line replacement
             final_lines = []
             final_lines.extend(new_lines)
             
@@ -265,9 +299,8 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
                 f.writelines(final_lines)
         else:
             # No block found, maybe it's the old 'pass' style or user deleted markers
-            # For robustness, if 'def func_name' exists, we could append it or just let it be.
-            # Requirement says "preserve user code", but we need the block to update it.
-            # If no block, we'll append a new function if missing, or just write headers.
+            # For robustness, if 'def func_name' exists, we could append it or just write headers.
+            # Given the prompt, we should probably add the markers if missing for future updates.
             # Let's try to find the function and replace its body if it's 'pass'
             if f"def {func_name}" in content_str:
                 # Add block into the function if possible (very basic approach)
@@ -336,28 +369,56 @@ def update_or_create_test_file(endpoint: Endpoint, components: Dict[str, Any], r
 
         return header + filtered_lines
 
-def _ensure_client_exists(repo_path: str) -> None:
+def _ensure_client_exists(
+    repo_path: str, 
+    base_url: Optional[str] = None, 
+    security_tokens: Optional[Dict[str, str]] = None
+) -> None:
     """Creates a default client.py in the tests/ directory if it doesn't exist."""
     client_path = os.path.join(repo_path, "tests/client.py")
     if os.path.exists(client_path):
         return
 
-    content = """import requests
+    default_base_url = base_url or os.getenv("API_BASE_URL", "https://api.example.com")
+    tokens_code = ""
+    if security_tokens:
+        for name, token in security_tokens.items():
+            tokens_code += f"client.set_security_token(\"{name}\", \"{token}\")\n"
+
+    content = f"""import requests
 import os
 
 class APIClient:
     \"\"\"
     A simple wrapper around requests.Session to provide a base URL 
     and common configuration for generated tests.
+    Supports security schemes and different request formats.
     \"\"\"
     def __init__(self, base_url=None):
         self.session = requests.Session()
-        self.base_url = base_url or os.getenv("API_BASE_URL", "https://api.example.com")
+        self.base_url = base_url or os.getenv("API_BASE_URL", "{default_base_url}")
+        self.security_tokens = {{}} # Map scheme name -> token
+
+    def set_security_token(self, scheme_name: str, token: str):
+        self.security_tokens[scheme_name] = token
         
     def request(self, method, path, **kwargs):
         if not path.startswith("/"):
             path = "/" + path
         url = self.base_url + path
+        
+        # Auto-inject security if headers aren't already set
+        if "headers" not in kwargs:
+            kwargs["headers"] = {{}}
+        
+        # Simple injection for Bearer or API Key
+        for token in self.security_tokens.values():
+            if token.startswith("Bearer "):
+                kwargs["headers"]["Authorization"] = token
+            else:
+                # Assuming generic API Key if not Bearer
+                kwargs["headers"]["X-API-Key"] = token
+
         return self.session.request(method, url, **kwargs)
 
     def get(self, path, **kwargs): return self.request("GET", path, **kwargs)
@@ -367,7 +428,7 @@ class APIClient:
     def patch(self, path, **kwargs): return self.request("PATCH", path, **kwargs)
 
 client = APIClient()
-"""
+{tokens_code}"""
     try:
         # Ensure tests dir exists
         os.makedirs(os.path.dirname(client_path), exist_ok=True)

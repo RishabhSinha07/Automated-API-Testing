@@ -91,12 +91,13 @@ class TestOpenAPIParser(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenAPIParser(bad_spec, is_yaml=True)
             
-    def test_unsupported_media_type(self):
+    def test_unsupported_media_type_now_handled(self):
         # Inject xml content type
         bad_spec = MINIMAL_OPENAPI.replace("application/json", "application/xml")
         parser = OpenAPIParser(bad_spec, is_yaml=True)
-        with self.assertRaises(ValueError):
-            parser.parse()
+        # Should NOT raise ValueError anymore, it picks application/xml
+        spec = parser.parse()
+        self.assertIn("200", spec.endpoint_map["GET /users"].responses)
 
 if __name__ == '__main__':
     unittest.main()

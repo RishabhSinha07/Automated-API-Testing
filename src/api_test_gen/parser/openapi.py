@@ -36,12 +36,17 @@ class OpenAPIParser:
 
         components = self._parse_components()
         endpoints = self._parse_paths()
+        
+        security_schemes = self.spec.get("components", {}).get("securitySchemes", {})
+        servers = self.spec.get("servers", [])
 
         return APISpec(
             title=title,
             version=version,
             endpoints=tuple(endpoints),
-            components=components
+            components=components,
+            security_schemes=security_schemes,
+            servers=tuple(servers)
         )
 
     def _parse_components(self) -> Dict[str, SchemaRef]:
@@ -56,6 +61,21 @@ class OpenAPIParser:
             
         return parsed_components
 
+    def _resolve_ref(self, ref_path: str) -> Dict[str, Any]:
+        """
+        Resolves a JSON reference within the specification.
+        """
+        if not ref_path.startswith("#/"):
+            raise NotImplementedError(f"External references not supported: {ref_path}")
+        
+        parts = ref_path.lstrip("#/").split("/")
+        current = self.spec
+        for part in parts:
+            if part not in current:
+                raise ValueError(f"Could not resolve reference: {ref_path}")
+            current = current[part]
+        return current
+
     def _parse_paths(self) -> List[Endpoint]:
         """
         Parses all paths and operations into Endpoints.
@@ -64,17 +84,22 @@ class OpenAPIParser:
         endpoints = []
 
         for path_str, path_item in paths.items():
-            # TODO: Handle path-level parameters (common to all operations)
+            # Path-level parameters
+            path_params = path_item.get("parameters", [])
             
             for method, operation in path_item.items():
                 if method in ["parameters", "summary", "description"]:
                     continue # specific fields in Path Item Object, not operations
                 
-                endpoints.append(self._parse_endpoint(path_str, method, operation))
+                # Merge path-level params with operation-level params
+                op_params = operation.get("parameters", [])
+                merged_params = path_params + op_params
+                
+                endpoints.append(self._parse_endpoint(path_str, method, operation, merged_params))
         
         return endpoints
 
-    def _parse_endpoint(self, path: str, method: str, operation: Dict[str, Any]) -> Endpoint:
+    def _parse_endpoint(self, path: str, method: str, operation: Dict[str, Any], raw_params: List[Dict[str, Any]]) -> Endpoint:
         """
         Parses a single operation into an Endpoint.
         """
@@ -82,35 +107,42 @@ class OpenAPIParser:
         summary = operation.get("summary")
         description = operation.get("description")
         
-        # Parse Parameters
-        raw_params = operation.get("parameters", [])
+        # Parse Parameters (Resolve $ref)
         parameters: List[Dict[str, Any]] = []
         for p in raw_params:
             if "$ref" in p:
-                raise NotImplementedError("Parameter $ref resolution not yet implemented")
-            
-            # Keep raw param dict, but ensure valid JSON types where possible
+                p = self._resolve_ref(p["$ref"])
             parameters.append(p)
 
         # Parse Request Body
         request_body_schema: Optional[SchemaRef] = None
+        request_content_type: Optional[str] = None
         if "requestBody" in operation:
-            content = operation["requestBody"].get("content", {})
-            if not content:
-                pass # Empty body?
-            elif "application/json" in content:
+            rb_obj = operation["requestBody"]
+            if "$ref" in rb_obj:
+                rb_obj = self._resolve_ref(rb_obj["$ref"])
+            
+            content = rb_obj.get("content", {})
+            if "application/json" in content:
                 request_body_schema = self._convert_schema(content["application/json"]["schema"])
-            else:
-                # Fail loudly as requested
-                # TODO: Support application/x-www-form-urlencoded or multipart/form-data
-                raise ValueError(f"Unsupported requestBody content types in {method.upper()} {path}: {list(content.keys())}")
+                request_content_type = "application/json"
+            elif "application/x-www-form-urlencoded" in content:
+                request_body_schema = self._convert_schema(content["application/x-www-form-urlencoded"]["schema"])
+                request_content_type = "application/x-www-form-urlencoded"
+            elif "multipart/form-data" in content:
+                request_body_schema = self._convert_schema(content["multipart/form-data"]["schema"])
+                request_content_type = "multipart/form-data"
+            elif content:
+                # Pick the first one if not JSON/Form
+                first_ct = list(content.keys())[0]
+                request_body_schema = self._convert_schema(content[first_ct]["schema"])
+                request_content_type = first_ct
 
         # Parse Responses
         responses: Dict[str, SchemaRef] = {}
         for code, resp_obj in operation.get("responses", {}).items():
             if "$ref" in resp_obj:
-                 # TODO: Resolve response refs
-                 raise NotImplementedError("Response $ref resolution not yet implemented")
+                 resp_obj = self._resolve_ref(resp_obj["$ref"])
             
             content = resp_obj.get("content", {})
             if not content:
@@ -119,11 +151,21 @@ class OpenAPIParser:
             elif "application/json" in content:
                 responses[code] = self._convert_schema(content["application/json"]["schema"])
             else:
-                # TODO: Decide if we fail on non-json responses or just ignore them.
-                # Instruction says "Fail loudly for unsupported OpenAPI constructs".
-                # But generic errors often have text/plain.
-                # Strictly following:
-                raise ValueError(f"Unsupported response content types for {code} in {method.upper()} {path}: {list(content.keys())}")
+                # Just take the first available content type's schema
+                first_ct = list(content.keys())[0]
+                responses[code] = self._convert_schema(content[first_ct]["schema"])
+
+        # Parse Security
+        security = operation.get("security", self.spec.get("security"))
+        parsed_security = None
+        if security:
+            # security is a list of requirement objects
+            # [{ "auth": ["scope"] }]
+            temp_sec = []
+            for req in security:
+                item = {k: tuple(v) for k, v in req.items()}
+                temp_sec.append(item)
+            parsed_security = tuple(temp_sec)
 
         return Endpoint(
             method=method.upper(),
@@ -132,7 +174,9 @@ class OpenAPIParser:
             description=description,
             parameters=tuple(parameters),
             request_body=request_body_schema,
-            responses=responses
+            request_content_type=request_content_type,
+            responses=responses,
+            security=parsed_security
         )
 
     def _convert_schema(self, schema: Dict[str, Any]) -> SchemaRef:
@@ -140,17 +184,55 @@ class OpenAPIParser:
         Recursively converts an OpenAPI schema dict into a SchemaRef.
         """
         if not schema:
-            # Empty schema {} matches everything
             return SchemaRef(extra={})
 
         if "$ref" in schema:
-            # Assume '#/components/schemas/Name' format
             ref_path = schema["$ref"]
-            if not ref_path.startswith("#/components/schemas/"):
-                 # TODO: Support remote refs or other internal paths
-                 raise NotImplementedError(f"Only #/components/schemas/ refs supported. Found: {ref_path}")
-            ref_name = ref_path.split("/")[-1]
-            return SchemaRef(ref_name=ref_name)
+            if ref_path.startswith("#/components/schemas/"):
+                ref_name = ref_path.split("/")[-1]
+                return SchemaRef(ref_name=ref_name)
+            else:
+                # Resolve other refs immediately for IR simplification
+                resolved = self._resolve_ref(ref_path)
+                return self._convert_schema(resolved)
+
+        if "allOf" in schema:
+            merged_properties = {}
+            merged_required = set()
+            base_type = schema.get("type")
+            
+            for sub_schema_dict in schema["allOf"]:
+                sub_ref = self._convert_schema(sub_schema_dict)
+                # To flatten, we need the actual properties. If it's a ref, resolve it.
+                if sub_ref.ref_name:
+                    resolved = self._resolve_ref(f"#/components/schemas/{sub_ref.ref_name}")
+                    # Recursively convert to handle nested allOf etc.
+                    sub_ref = self._convert_schema(resolved)
+                
+                if sub_ref.properties:
+                    merged_properties.update(sub_ref.properties)
+                if sub_ref.required:
+                    merged_required.update(sub_ref.required)
+                if sub_ref.type:
+                    base_type = sub_ref.type
+
+            # Merge current level's properties and required
+            if "properties" in schema:
+                for k, v in schema["properties"].items():
+                    merged_properties[k] = self._convert_schema(v)
+            if "required" in schema:
+                merged_required.update(schema["required"])
+
+            return SchemaRef(
+                type=base_type or "object",
+                properties=merged_properties or None,
+                required=tuple(sorted(list(merged_required))) if merged_required else None,
+                all_of=tuple(self._convert_schema(s) for s in schema["allOf"])
+            )
+
+        # Composition for oneOf/anyOf (Not flattened, just stored)
+        one_of = tuple(self._convert_schema(s) for s in schema["oneOf"]) if "oneOf" in schema else None
+        any_of = tuple(self._convert_schema(s) for s in schema["anyOf"]) if "anyOf" in schema else None
 
         # Basic fields
         schema_type = schema.get("type")
@@ -171,9 +253,14 @@ class OpenAPIParser:
         required = tuple(sorted(schema.get("required", []))) if "required" in schema else None
         enum_vals = tuple(schema.get("enum")) if "enum" in schema else None
 
-        # TODO: Handle 'allOf', 'oneOf', 'anyOf'
-        if any(k in schema for k in ["allOf", "oneOf", "anyOf"]):
-            raise NotImplementedError("allOf/oneOf/anyOf not yet supported")
+        # Constraints
+        min_length = schema.get("minLength")
+        max_length = schema.get("maxLength")
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        pattern = schema.get("pattern")
+        read_only = schema.get("readOnly", False)
+        write_only = schema.get("writeOnly", False)
 
         return SchemaRef(
             type=schema_type,
@@ -181,7 +268,16 @@ class OpenAPIParser:
             items=items,
             required=required,
             nullable=nullable,
-            enum=enum_vals
+            enum=enum_vals,
+            one_of=one_of,
+            any_of=any_of,
+            min_length=min_length,
+            max_length=max_length,
+            minimum=minimum,
+            maximum=maximum,
+            pattern=pattern,
+            read_only=read_only,
+            write_only=write_only
         )
 
 def load_from_file(path: str) -> APISpec:

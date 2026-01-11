@@ -2,7 +2,7 @@ import os
 import tempfile
 import json
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -44,6 +44,8 @@ async def open_native_picker():
 class GenerateRequest(BaseModel):
     spec_content: str
     repo_path: str
+    tokens: Optional[Dict[str, str]] = None # { "scheme": "token" }
+    server_url: Optional[str] = None
 
 class TestFileResponse(BaseModel):
     fileName: str
@@ -100,14 +102,26 @@ async def generate_tests(request: GenerateRequest):
         # 5. Apply changes and collect results
         # Creates
         for endpoint in diff.create:
-            update_or_create_test_file(endpoint, api_spec.components, request.repo_path)
+            update_or_create_test_file(
+                endpoint, 
+                api_spec.components, 
+                request.repo_path,
+                base_url=request.server_url,
+                security_tokens=request.tokens
+            )
             results.append(get_file_info(endpoint, "Created"))
             
         # Updates
         for eid in diff.update:
             endpoint = api_spec.endpoint_map.get(eid)
             if endpoint:
-                update_or_create_test_file(endpoint, api_spec.components, request.repo_path)
+                update_or_create_test_file(
+                    endpoint, 
+                    api_spec.components, 
+                    request.repo_path,
+                    base_url=request.server_url,
+                    security_tokens=request.tokens
+                )
                 results.append(get_file_info(endpoint, "Updated"))
                 
         # Skips (optional: show them in results too)

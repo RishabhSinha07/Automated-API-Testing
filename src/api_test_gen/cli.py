@@ -23,8 +23,10 @@ def cli():
 @cli.command()
 @click.option('--spec', required=True, type=click.Path(exists=True), help='Path to OpenAPI JSON/YAML file')
 @click.option('--repo', required=True, type=click.Path(exists=True), help='Path to local repository where test files are stored')
+@click.option('--token', multiple=True, help='Security tokens in SCHEME:TOKEN format (e.g. Bearer:my_token)')
+@click.option('--server-url', help='Override the base URL for the API')
 @click.option('--verbose', is_flag=True, help='Print detailed logs')
-def generate(spec: str, repo: str, verbose: bool):
+def generate(spec: str, repo: str, token: tuple, server_url: Optional[str], verbose: bool):
     """Generate or update test files from an OpenAPI spec."""
     setup_logging(verbose)
     logger = logging.getLogger("apitestgen")
@@ -53,8 +55,19 @@ def generate(spec: str, repo: str, verbose: bool):
         click.echo(f"Error reading repository state: {e}", err=True)
         sys.exit(2)
 
-    if verbose:
-        logger.info(f"Found {len(existing_tests)} existing test files.")
+    # Handle tokens
+    tokens_dict = {}
+    for t in token:
+        if ':' in t:
+            scheme, val = t.split(':', 1)
+            tokens_dict[scheme] = val
+        else:
+            tokens_dict['default'] = t
+
+    # Resolve Server URL
+    base_url = server_url
+    if not base_url and api_spec.servers:
+        base_url = api_spec.servers[0].get('url')
 
     # 3. Compute Diff
     if verbose:
@@ -70,7 +83,13 @@ def generate(spec: str, repo: str, verbose: bool):
         for endpoint in diff.create:
             if verbose:
                 logger.info(f"Creating: {endpoint.method} {endpoint.path} ({endpoint.id})")
-            update_or_create_test_file(endpoint, api_spec.components, repo_path)
+            update_or_create_test_file(
+                endpoint, 
+                api_spec.components, 
+                repo_path, 
+                base_url=base_url, 
+                security_tokens=tokens_dict
+            )
             
         # Update
         for endpoint_id in diff.update:
@@ -78,22 +97,24 @@ def generate(spec: str, repo: str, verbose: bool):
             if endpoint:
                 if verbose:
                     logger.info(f"Updating: {endpoint.method} {endpoint.path} ({endpoint.id})")
-                update_or_create_test_file(endpoint, api_spec.components, repo_path)
+                update_or_create_test_file(
+                    endpoint, 
+                    api_spec.components, 
+                    repo_path, 
+                    base_url=base_url, 
+                    security_tokens=tokens_dict
+                )
             elif verbose:
                 logger.warning(f"Endpoint {endpoint_id} marked for update but not found in spec.")
 
         # Skip
         if verbose:
-            for endpoint_id in diff.skip:
-                endpoint = api_spec.endpoint_map.get(endpoint_id)
-                status = f"{endpoint.method} {endpoint.path}" if endpoint else endpoint_id
-                logger.info(f"Skipping (unchanged): {status}")
+            logger.info(f"Skipping {len(diff.skip)} endpoints.")
 
         # Delete
         for metadata in diff.delete:
             if verbose:
-                logger.info(f"Deleting obsolete: {metadata.relative_path} ({metadata.endpoint_id})")
-            # GenerationEngine has a private delete method, but we can call it or implement here
+                logger.info(f"Deleting obsolete: {metadata.relative_path}")
             generator._delete_test_file(metadata)
 
     except Exception as e:

@@ -40,7 +40,21 @@ class SchemaRef:
     items: Optional['SchemaRef'] = None
     required: Optional[Tuple[str, ...]] = None # Tuple for immutability
     nullable: bool = False
-    enum: Optional[Tuple[str, ...]] = None # Tuple for immutability
+    enum: Optional[Tuple[Any, ...]] = None # Tuple for immutability
+    
+    # Schema Composition
+    all_of: Optional[Tuple['SchemaRef', ...]] = None
+    one_of: Optional[Tuple['SchemaRef', ...]] = None
+    any_of: Optional[Tuple['SchemaRef', ...]] = None
+
+    # Validation Constraints
+    min_length: Optional[int] = None
+    max_length: Optional[int] = None
+    minimum: Optional[Union[int, float]] = None
+    maximum: Optional[Union[int, float]] = None
+    pattern: Optional[str] = None
+    read_only: bool = False
+    write_only: bool = False
     
     # Additional raw schema data for full fidelity if needed
     extra: Optional[Dict[str, Any]] = field(
@@ -51,7 +65,7 @@ class SchemaRef:
     )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to directory for hashing."""
+        """Convert to dictionary for hashing."""
         d: Dict[str, Any] = {}
         if self.ref_name:
             d['$ref'] = self.ref_name
@@ -66,8 +80,25 @@ class SchemaRef:
         if self.nullable:
             d['nullable'] = True
         if self.enum:
-            d['enum'] = self.enum
-        # extra is excluded from hashing/identity to avoid ambiguity with compare=False
+            d['enum'] = list(self.enum)
+        
+        # Composition
+        if self.all_of:
+            d['allOf'] = [s.to_dict() for s in self.all_of]
+        if self.one_of:
+            d['oneOf'] = [s.to_dict() for s in self.one_of]
+        if self.any_of:
+            d['anyOf'] = [s.to_dict() for s in self.any_of]
+
+        # Constraints
+        if self.min_length is not None: d['minLength'] = self.min_length
+        if self.max_length is not None: d['maxLength'] = self.max_length
+        if self.minimum is not None: d['minimum'] = self.minimum
+        if self.maximum is not None: d['maximum'] = self.maximum
+        if self.pattern is not None: d['pattern'] = self.pattern
+        if self.read_only: d['readOnly'] = True
+        if self.write_only: d['writeOnly'] = True
+            
         return d
 
     @property
@@ -89,7 +120,11 @@ class Endpoint:
     # Request details
     parameters: Tuple[Dict[str, Any], ...] = field(default_factory=tuple) # Query/Path/Header params
     request_body: Optional[SchemaRef] = None
+    request_content_type: Optional[str] = None # e.g. "application/json", "multipart/form-data"
     
+    # Security requirements for this endpoint
+    security: Optional[Tuple[Dict[str, Tuple[str, ...]], ...]] = None
+
     # Responses: Status Code -> Schema
     responses: Dict[str, SchemaRef] = field(default_factory=dict)  # status_code as string ("200", "default")
     
@@ -111,6 +146,12 @@ class APISpec:
     # Shared schemas (components/schemas)
     components: Dict[str, SchemaRef] = field(default_factory=dict)
     
+    # Security Schemes (components/securitySchemes)
+    security_schemes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    
+    # Servers
+    servers: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
+
     @property
     def endpoint_map(self) -> Dict[str, Endpoint]:
         """Map of Endpoint ID -> Endpoint"""
